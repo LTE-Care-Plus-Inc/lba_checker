@@ -400,13 +400,13 @@ for _, w in auth_df.sort_values(["Client Name", "Auth Start"]).iterrows():
         "Expectation Source": expected_basis,
 
         # Actuals to date
-        "BT Hours (Done)": round(float(bt_hours), 2),
-        "Supervision Hours (Done)": round(float(sup_hours), 2),
+        "BT Service Hours Billed": round(float(bt_hours), 2),
+        "Supervision Hours Billed": round(float(sup_hours), 2),
         "Parent Training Hours (Done)": round(float(pt_hours), 2),
 
         # Supervision compliance (against BT actually done)
-        "Supervision 5% of BT (to date)": round(float(sup_needed_from_bt_done), 2),
-        "Δ Supervision (done - 5% of BT done)": round(float(delta_vs_bt5), 2),
+        "5% Supervision Required": round(float(sup_needed_from_bt_done), 2),
+        "Supervision Hours Status": round(float(delta_vs_bt5), 2),
         "Supervision 5% OK": bool(sup5_ok),
         "Supervision Shortfall (hrs)": round(float(max(0.0, sup_needed_from_bt_done - sup_hours)), 2),
 
@@ -487,7 +487,8 @@ pt_hours_view = summary[pt_hours_cols].copy() if not summary.empty else pd.DataF
 # ------------------ One-page HTML (Summary + Reassessments; no Totals) ------------------
 def table_from_df(dfx: pd.DataFrame, row_classes=None) -> str:
     cols = list(dfx.columns)
-    thead = "<thead><tr>" + "".join(f"<th>{html_escape(c)}</th>" for c in cols) + "</tr></thead>"
+    # allow raw HTML in headers (for <strong> etc.)
+    thead = "<thead><tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr></thead>"
     rows_html = []
     for i, row in dfx.iterrows():
         cls = ""
@@ -501,6 +502,7 @@ def table_from_df(dfx: pd.DataFrame, row_classes=None) -> str:
         tds = "".join(f"<td>{html_escape(v)}</td>" for v in row.values)
         rows_html.append(f"<tr{cls}>{tds}</tr>")
     return f"<table>{thead}<tbody>{''.join(rows_html)}</tbody></table>"
+
 
 def one_page_html_colored(
     summary: pd.DataFrame,
@@ -520,19 +522,19 @@ def one_page_html_colored(
     # ---------- Supervision summary (no PT columns here) ----------
     sup_pref = [
         "Client Name","Auth Start","Auth End","Supervision LBA",
-        "BT Hours (Done)","Supervision Hours (Done)",
-        "Supervision 5% of BT (to date)","Δ Supervision (done - 5% of BT done)",
+        "BT Service Hours Billed","Supervision Hours Billed",
+        "5% Supervision Required","Supervision Hours Status",
         "Supervision 5% OK",
     ]
     sup_cols_present = [c for c in sup_pref if c in summary.columns]
     sup_df = summary[sup_cols_present].copy()
 
     # Derive 5% OK defensively if missing
-    if "Supervision 5% OK" not in sup_df.columns and {"BT Hours (Done)","Supervision Hours (Done)"}.issubset(sup_df.columns):
-        bt = pd.to_numeric(sup_df["BT Hours (Done)"], errors="coerce").fillna(0.0)
-        sup = pd.to_numeric(sup_df["Supervision Hours (Done)"], errors="coerce").fillna(0.0)
-        sup_df["Supervision 5% of BT (to date)"] = (bt * (sup_percent/100.0)).round(2)
-        sup_df["Supervision 5% OK"] = (sup >= sup_df["Supervision 5% of BT (to date)"])
+    if "Supervision 5% OK" not in sup_df.columns and {"BT Service Hours Billed","Supervision Hours Billed"}.issubset(sup_df.columns):
+        bt = pd.to_numeric(sup_df["BT Service Hours Billed"], errors="coerce").fillna(0.0)
+        sup = pd.to_numeric(sup_df["Supervision Hours Billed"], errors="coerce").fillna(0.0)
+        sup_df["5% Supervision Required"] = (bt * (sup_percent/100.0)).round(2)
+        sup_df["Supervision 5% OK"] = (sup >= sup_df["5% Supervision Required"])
 
     for c in ["Supervision 5% OK"]:
         if c in sup_df.columns:
@@ -591,12 +593,19 @@ def one_page_html_colored(
                      if reassess_df is not None and not reassess_df.empty
                      else "<div style='font-size:10px;color:#666;'>No reassessments for the selected LBA(s) in this window.</div>")
 
+    sup_df = sup_df.rename(columns={
+        "BT Service Hours Billed": "BT Service Hours <strong>Billed</strong>",
+        "5% Supervision Required": "5% Supervision <strong>Required</strong>",
+        "Supervision Hours Billed": "Supervision Hours <strong>Billed</strong>",
+        "Supervision Hours Status": "Supervision Hours <strong>Status</strong>",
+    })
+    
     html = f"""<!doctype html><html><head><meta charset='utf-8'>{style}
     <title>{html_escape(title_text)}</title></head>
     <body>
       <h1>{html_escape(title_text)}</h1>
       <div class="meta">Generated: {now}</div>
-
+    
       <div class="section"><strong>Supervision Compliance</strong>{table_from_df(sup_df, sup_row_classes)}</div>
 
       <div class="section"><strong>Parent Training Compliance</strong>{pt_table_html}</div>
@@ -675,9 +684,9 @@ html_report = one_page_html_colored(
 # Supervision-focused view
 sup_cols = [
     "Client Name","Auth Start","Auth End","Supervision LBA",
-    "BT Hours (Done)","Supervision Hours (Done)",
-    "Supervision 5% of BT (to date)",
-    "Δ Supervision (done - 5% of BT done)",
+    "BT Service Hours Billed","Supervision Hours Billed",
+    "5% Supervision Required",
+    "Supervision Hours Status",
     "Supervision Shortfall (hrs)",
     "Planned Weekly Service Hours",
     "Expected BT Service Hours (auth period)",
