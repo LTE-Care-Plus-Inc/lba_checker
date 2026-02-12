@@ -7,6 +7,8 @@ from calendar import monthrange
 import re
 import io
 from zipfile import ZipFile
+import plotly.graph_objects as go
+
 
 # Optional PDF support via wkhtmltopdf + pdfkit
 PDFKIT_AVAILABLE = False
@@ -697,7 +699,9 @@ sup_cols = [
 sup_view = summary[sup_cols].copy() if not summary.empty else pd.DataFrame(columns=sup_cols)
 
 # ------------------ Main content tabs ------------------
-tab_sup, tab_pt, tab_re, tab_exp = st.tabs(["Supervision", "Parent Training", "Reassessments", "One-Pager & Exports"])
+tab_sup, tab_pt, tab_re, tab_trend, tab_exp = st.tabs(
+    ["Supervision", "Parent Training", "Reassessments", "📈 Client Trend", "One-Pager & Exports"]
+)
 
 with tab_sup:
     st.subheader("Supervision Compliance (5% of BT)")
@@ -741,6 +745,139 @@ with tab_re:
     else:
         st.caption("Status meanings: Overdue 🔴 • Upcoming 🟡 • Not Due Yet 🟢")
         st.dataframe(reassess_df, use_container_width=True)
+with tab_trend:
+    st.subheader("📈 Client Supervision Compliance Gap")
+
+    if aloha.empty:
+        st.info("No session data available for selected filters.")
+        st.stop()
+
+    # ---- Precompute compliance for ALL clients first ----
+    aloha["YearMonth"] = aloha["Appt. Date"].dt.to_period("M").dt.to_timestamp()
+
+    monthly_all = (
+        aloha.groupby(["name_key", "Client Name", "YearMonth"])
+        .apply(lambda df: pd.Series({
+            "BT_Hours": df.loc[df["is_bt_service"], "Billing Hours"].sum(),
+            "Actual_Supervision": df.loc[df["is_supervision"], "Billing Hours"].sum()
+        }))
+        .reset_index()
+    )
+
+    monthly_all["Required_Supervision"] = monthly_all["BT_Hours"] * sup_fraction
+    monthly_all["Compliance_Gap"] = (
+        monthly_all["Actual_Supervision"] - monthly_all["Required_Supervision"]
+    )
+    monthly_all["Compliant"] = monthly_all["Compliance_Gap"] >= 0
+
+    # ---- Toggle to filter clients ----
+    show_only_flagged_clients = st.toggle(
+        "Show Only Clients With Non-Compliant Months",
+        value=False
+    )
+
+    if show_only_flagged_clients:
+        flagged_keys = monthly_all.loc[
+            ~monthly_all["Compliant"], "name_key"
+        ].unique()
+        client_df = monthly_all[monthly_all["name_key"].isin(flagged_keys)]
+    else:
+        client_df = monthly_all
+
+    if client_df.empty:
+        st.info("No clients match this filter.")
+        st.stop()
+
+    client_options = sorted(client_df["Client Name"].unique())
+    selected_client = st.selectbox("Select Client", client_options)
+
+    selected_key = name_key(selected_client)
+    monthly = client_df[client_df["name_key"] == selected_key] \
+        .sort_values("YearMonth")
+
+    if monthly.empty:
+        st.warning("No data found for this client.")
+        st.stop()
+
+    # ---- Compliance Count ----
+    failing_count = (~monthly["Compliant"]).sum()
+    total_months = len(monthly)
+
+    if failing_count > 0:
+        st.error(f"❗ {failing_count} of {total_months} month(s) are NON-COMPLIANT.")
+    else:
+        st.success(f"✅ All {total_months} month(s) are compliant.")
+
+    # ---- Plotly Chart ----
+    fig = go.Figure()
+
+    # Compliance Gap Line
+    fig.add_trace(go.Scatter(
+        x=monthly["YearMonth"],
+        y=monthly["Compliance_Gap"],
+        mode="lines+markers",
+        name="Compliance Gap",
+        customdata=monthly[
+            ["Actual_Supervision", "Required_Supervision", "BT_Hours"]
+        ],
+        hovertemplate=(
+            "<b>%{x|%Y-%m}</b><br>"
+            "Compliance Gap: %{y:.2f} hrs<br>"
+            "Actual Supervision: %{customdata[0]:.2f} hrs<br>"
+            "Required Supervision: %{customdata[1]:.2f} hrs<br>"
+            "BT Hours: %{customdata[2]:.2f} hrs"
+            "<extra></extra>"
+        )
+    ))
+
+    # Red markers for failing months
+    failing_months = monthly[~monthly["Compliant"]]
+    if not failing_months.empty:
+        fig.add_trace(go.Scatter(
+            x=failing_months["YearMonth"],
+            y=failing_months["Compliance_Gap"],
+            mode="markers",
+            marker=dict(size=12, color="red", symbol="x"),
+            name="Non-Compliant"
+        ))
+
+    # Zero reference line
+    fig.add_hline(
+        y=0,
+        line_dash="dash",
+        line_color="black",
+        annotation_text="0 = Fully Compliant",
+        annotation_position="top left"
+    )
+
+    fig.update_layout(
+        height=450,
+        xaxis_title="Month",
+        yaxis_title="Compliance Gap (Actual - Required)",
+        hovermode="x unified"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("### 📊 Monthly Breakdown")
+
+    display_table = monthly.rename(columns={
+        "YearMonth": "Month",
+        "BT_Hours": "BT Hours",
+        "Actual_Supervision": "Actual Supervision",
+        "Required_Supervision": "Required Supervision (5%)",
+        "Compliance_Gap": "Compliance Gap"
+    })
+
+    # ✅ Remove internal matching column
+    display_table = display_table.drop(columns=["name_key"], errors="ignore")
+
+    # Optional: ensure Month shows date only
+    display_table["Month"] = pd.to_datetime(display_table["Month"], errors="coerce").dt.date
+
+
+
+    st.dataframe(display_table, use_container_width=True)
 
 with tab_exp:
     st.subheader("Download One-Pager (HTML) & Data Exports")
@@ -781,27 +918,67 @@ with tab_exp:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-    st.markdown("---")
-    st.subheader("Per-LBA One-Pager (bulk export)")
+        st.markdown("---")
+    st.subheader("📊 Compliance Pivot Export (All Clients)")
 
-    if not all_lbas_list:
-        st.info("No LBAs detected from the Authorization/Expectations data.")
-    else:
-        zl_html = make_per_lba_zip(all_lbas_list, summary, pt_view, reassess_df, sup_percent, window_label, as_pdf=False)
-        st.download_button(
-            "📦 Download Per-LBA One-Pagers (ZIP • HTML files)",
-            data=zl_html,
-            file_name=f"per_lba_onepagers_html_{slug}.zip",
-            mime="application/zip"
+    if not aloha.empty:
+
+        aloha_copy = aloha.copy()
+        aloha_copy["YearMonth"] = aloha_copy["Appt. Date"].dt.to_period("M").dt.to_timestamp()
+
+        # Monthly aggregation
+        monthly_all = (
+            aloha_copy.groupby(["Client Name", "YearMonth"])
+            .apply(lambda df: pd.Series({
+                "BT_Hours": df.loc[df["is_bt_service"], "Billing Hours"].sum(),
+                "Actual_Supervision": df.loc[df["is_supervision"], "Billing Hours"].sum()
+            }))
+            .reset_index()
         )
 
-        if PDFKIT_AVAILABLE:
-            zl_pdf = make_per_lba_zip(all_lbas_list, summary, pt_view, reassess_df, sup_percent, window_label, as_pdf=True)
-            st.download_button(
-                "📦 Download Per-LBA One-Pagers (ZIP • PDF files)",
-                data=zl_pdf,
-                file_name=f"per_lba_onepagers_pdf_{slug}.zip",
-                mime="application/zip"
-            )
+        monthly_all["Required_Supervision"] = monthly_all["BT_Hours"] * sup_fraction
+        monthly_all["Compliance_Gap"] = (
+            monthly_all["Actual_Supervision"] - monthly_all["Required_Supervision"]
+        )
+
+        # Convert month to date only
+        monthly_all["YearMonth"] = pd.to_datetime(monthly_all["YearMonth"]).dt.date
+
+        # Pivot table
+        pivot_df = monthly_all.pivot_table(
+            index="Client Name",
+            columns="YearMonth",
+            values="Compliance_Gap",
+            aggfunc="sum"
+        ).reset_index()
+
+        # Sort month columns chronologically
+        month_cols = sorted([c for c in pivot_df.columns if c != "Client Name"])
+        pivot_df = pivot_df[["Client Name"] + month_cols]
+
+        # Optional: round values
+        pivot_df[month_cols] = pivot_df[month_cols].round(2)
+
+        # Summary metric
+        total_clients = len(pivot_df)
+
+        # Count total failing cells
+        fail_count = (pivot_df[month_cols] < 0).sum().sum()
+
+        if fail_count > 0:
+            st.error(f"❗ {fail_count} under-supervised month(s) across {total_clients} clients.")
         else:
-            st.caption("PDF export requires `wkhtmltopdf` + `pdfkit`. Install the wkhtmltopdf binary and `pip install pdfkit`, then restart the app.")
+            st.success(f"✅ All {total_clients} clients compliant for selected window.")
+
+        # Export
+        export_bytes = to_excel_bytes({
+            "Compliance Pivot": pivot_df
+        })
+
+        st.download_button(
+            "📥 Download Compliance Pivot (All Clients)",
+            data=export_bytes,
+            file_name=f"compliance_pivot_{slug}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
