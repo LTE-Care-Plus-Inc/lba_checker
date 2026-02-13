@@ -982,3 +982,28 @@ with tab_exp:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
+        st.markdown("---")
+    st.subheader("Per-LBA One-Pager (bulk export)")
+
+    if not all_lbas_list:
+        st.info("No LBAs detected from the Authorization/Expectations data.")
+    else:
+        zl_html = make_per_lba_zip(all_lbas_list, summary, pt_view, reassess_df, sup_percent, window_label, as_pdf=False)
+        st.download_button(
+            "📦 Download Per-LBA One-Pagers (ZIP • HTML files)",
+            data=zl_html,
+            file_name=f"per_lba_onepagers_html_{slug}.zip",
+            mime="application/zip"
+        )
+
+        if PDFKIT_AVAILABLE:
+            zl_pdf = make_per_lba_zip(all_lbas_list, summary, pt_view, reassess_df, sup_percent, window_label, as_pdf=True)
+            st.download_button(
+                "📦 Download Per-LBA One-Pagers (ZIP • PDF files)",
+                data=zl_pdf,
+                file_name=f"per_lba_onepagers_pdf_{slug}.zip",
+                mime="application/zip"
+            )
+        else:
+            st.caption("PDF export requires `wkhtmltopdf` + `pdfkit`. Install the wkhtmltopdf binary and `pip install pdfkit`, then restart the app.")
+
