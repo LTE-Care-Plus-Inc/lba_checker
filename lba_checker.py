@@ -29,19 +29,22 @@ st.markdown(
 Upload your **Aloha report** and a single **Authorization + Expectations** file.
 
 **What this checks**
+- **Auth window**: Auth Start = Reassessment Date − 6 months; Auth End = Reassessment Date
 - **Supervision**: 5% of BT hours actually performed (to-date) per auth window
 - **Parent Training**: at least one PT session **each month** in the auth window
 - Expected supervision (provided per window or computed by weekly × weeks × %)
 - LBA filtering (from Auth/Expected file, not from Aloha)
 
-**Matching note:** Names are matched on **(first,last)** only — middles/initials & suffixes are ignored (e.g., *“Rathbone, Sophie”* ↔ *“Rathbone, Sophie R”*).
+**Matching note:** Names are matched on **(first,last)** only — middles/initials & suffixes are ignored (e.g., *"Rathbone, Sophie"* ↔ *"Rathbone, Sophie R"*).
 """
 )
 
 # ------------------ Uploads ------------------
 aloha_file = st.file_uploader("Aloha report (CSV or Excel)", type=["csv", "xlsx", "xls"])
 auth_expect_file = st.file_uploader(
-    "Authorization + Expectations file (one file) — required: Client Name, Auth Start, Auth End; optional: Weekly Service Hours, Expected Supervision Hours, Supervision LBA",
+    "Authorization + Expectations file (one file) — required: Child's Full Name, Reassessment Date "
+    "(Auth Start = Reassessment Date − 6 months, Auth End = Reassessment Date); "
+    "optional: Weekly Service Hours, Expected Supervision Hours, Supervision LBA",
     type=["csv", "xlsx", "xls"]
 )
 
@@ -82,6 +85,9 @@ def colnorm(df: pd.DataFrame) -> pd.DataFrame:
         "Hours": "Billing Hours",
         "Client": "Client Name",
         "Client_name": "Client Name",
+        # Reassessment Date → Auth End (Auth Start is derived as Auth End - 6 months)
+        "Reassessment Date": "Auth End",
+        # Legacy aliases still supported
         "Auth Start Date": "Auth Start",
         "Authorization Start": "Auth Start",
         "Auth End Date": "Auth End",
@@ -142,6 +148,12 @@ def month_bounds(any_date: pd.Timestamp):
     last_day = monthrange(y, m)[1]
     end = pd.Timestamp(year=y, month=m, day=last_day)
     return start, end
+
+def derive_auth_start(auth_end: pd.Timestamp) -> pd.Timestamp:
+    """Compute Auth Start as exactly 6 calendar months before Auth End."""
+    if pd.isna(auth_end):
+        return pd.NaT
+    return (auth_end - pd.DateOffset(months=6)).normalize()
 
 def html_escape(s):
     return (str(s)
@@ -230,9 +242,12 @@ with date_tab3:
 aloha = aloha[(aloha["Appt. Date"] >= s_start) & (aloha["Appt. Date"] <= s_end)].copy()
 
 # ------------------ Auth periods & per-window hours (SINGLE combined file) ------------------
-auth_in_aloha = {"Auth Start", "Auth End"}.issubset(aloha.columns)
+# Check if Aloha itself contains auth columns (Auth End required; Auth Start derived if missing)
+auth_in_aloha = "Auth End" in aloha.columns  # colnorm already mapped Reassessment Date → Auth End
+
 if auth_in_aloha:
-    maybe_cols = ["Client Name","Auth Start","Auth End","Weekly Service Hours","Expected Supervision Hours","Supervision LBA"]
+    maybe_cols = ["Client Name", "Auth Start", "Auth End", "Weekly Service Hours",
+                  "Expected Supervision Hours", "Supervision LBA"]
     present = [c for c in maybe_cols if c in aloha.columns]
     auth_df = colnorm(aloha[present].dropna(how="all"))
 else:
@@ -240,21 +255,29 @@ else:
         st.error("Please upload the **Authorization + Expectations** file (since Aloha does not include auth columns).")
         st.stop()
     tmp = colnorm(read_any(auth_expect_file))
-    req = ["Client Name", "Auth Start", "Auth End"]
+    # After colnorm, Reassessment Date has been mapped to Auth End
+    req = ["Child's Full Name", "Auth End"]
     miss2 = [c for c in req if c not in tmp.columns]
     if miss2:
-        st.error(f"Authorization+Expectations file missing columns: {miss2}")
+        st.error(
+            f"Authorization+Expectations file missing columns: {miss2}. "
+            "Expected a 'Reassessment Date' column (or 'Auth End' / 'Auth End Date')."
+        )
         st.stop()
     auth_df = tmp.dropna(subset=req).copy()
 
 # Parse/normalize auth fields
-auth_df["Client Name"] = auth_df["Client Name"].astype(str).str.strip()
-auth_df["Auth Start"]  = parse_date_series(auth_df["Auth Start"])
+auth_df["Client Name"] = auth_df["Child's Full Name"].astype(str).str.strip()
 auth_df["Auth End"]    = parse_date_series(auth_df["Auth End"])
+
+# Derive Auth Start = Auth End - 6 months (override any pre-existing Auth Start column)
+auth_df["Auth Start"] = auth_df["Auth End"].apply(derive_auth_start)
+
 for c in ["Weekly Service Hours", "Expected Supervision Hours"]:
-    if c not in auth_df.columns: auth_df[c] = pd.NA
-auth_df["Weekly Service Hours"] = pd.to_numeric(auth_df["Weekly Service Hours"], errors="coerce")
-auth_df["Expected Supervision Hours"] = pd.to_numeric(auth_df["Expected Supervision Hours"], errors="coerce")
+    if c not in auth_df.columns:
+        auth_df[c] = pd.NA
+auth_df["Weekly Service Hours"]        = pd.to_numeric(auth_df["Weekly Service Hours"], errors="coerce")
+auth_df["Expected Supervision Hours"]  = pd.to_numeric(auth_df["Expected Supervision Hours"], errors="coerce")
 if "Supervision LBA" not in auth_df.columns:
     auth_df["Supervision LBA"] = pd.NA
 auth_df["LBA List (window)"] = auth_df["Supervision LBA"].apply(norm_lba_list)
@@ -381,7 +404,7 @@ for _, w in auth_df.sort_values(["Client Name", "Auth Start"]).iterrows():
     delta_vs_bt5 = sup_hours - sup_needed_from_bt_done
     sup5_ok = delta_vs_bt5 >= 0
 
-    # Full-period “max” supervision based on weekly plan (always computed)
+    # Full-period "max" supervision based on weekly plan (always computed)
     max_sup_full = (weekly or 0.0) * wks * sup_fraction
 
     # Expected BT service hours for the full auth period (plan × weeks)
@@ -438,7 +461,7 @@ for _, r in auth_df.iterrows():
         continue
     lba_tag = ", ".join(win_lbas) if win_lbas else "Unassigned"
 
-    # Due rule: using Auth End
+    # Due rule: Auth End = Reassessment Date
     due = aend
     if due < today:
         status = "Overdue"
@@ -450,7 +473,7 @@ for _, r in auth_df.iterrows():
     reassess_rows.append({
         "Client Name": client,
         "Auth Start": astart.date() if pd.notna(astart) else None,
-        "Auth End": aend.date() if pd.notna(aend) else None,
+        "Reassessment Date": aend.date() if pd.notna(aend) else None,
         "Reassessment Due": due.date(),
         "Status": status,
         "Supervision LBA": lba_tag
@@ -489,7 +512,6 @@ pt_hours_view = summary[pt_hours_cols].copy() if not summary.empty else pd.DataF
 # ------------------ One-page HTML (Summary + Reassessments; no Totals) ------------------
 def table_from_df(dfx: pd.DataFrame, row_classes=None) -> str:
     cols = list(dfx.columns)
-    # allow raw HTML in headers (for <strong> etc.)
     thead = "<thead><tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr></thead>"
     rows_html = []
     for i, row in dfx.iterrows():
@@ -542,7 +564,6 @@ def one_page_html_colored(
         if c in sup_df.columns:
             sup_df[c] = sup_df[c].map(lambda x: "✓" if to_bool(x) is True else ("✗" if to_bool(x) is False else x))
 
-    # Keep page compact
     max_rows = 35
     if len(sup_df) > max_rows:
         sup_df = sup_df.head(max_rows).reset_index(drop=True)
@@ -564,13 +585,11 @@ def one_page_html_colored(
         pt_cols_present = [c for c in pt_pref if c in pt_df.columns]
         pt_tbl = pt_df[pt_cols_present].copy()
 
-        # Iconify booleans
         if "PT Monthly OK" in pt_tbl.columns:
             pt_tbl["PT Monthly OK"] = pt_tbl["PT Monthly OK"].map(
                 lambda x: "✓" if to_bool(x) is True else ("✗" if to_bool(x) is False else x)
             )
 
-        # Limit rows
         if len(pt_tbl) > max_rows:
             pt_tbl = pt_tbl.head(max_rows).reset_index(drop=True)
 
@@ -601,13 +620,13 @@ def one_page_html_colored(
         "Supervision Hours Billed": "Supervision Hours <strong>Billed</strong>",
         "Supervision Hours Status": "Supervision Hours <strong>Status</strong>",
     })
-    
+
     html = f"""<!doctype html><html><head><meta charset='utf-8'>{style}
     <title>{html_escape(title_text)}</title></head>
     <body>
       <h1>{html_escape(title_text)}</h1>
       <div class="meta">Generated: {now}</div>
-    
+
       <div class="section"><strong>Supervision Compliance</strong>{table_from_df(sup_df, sup_row_classes)}</div>
 
       <div class="section"><strong>Parent Training Compliance</strong>{pt_table_html}</div>
@@ -618,13 +637,11 @@ def one_page_html_colored(
 
 # ------------------ Per-LBA helpers ------------------
 def filtered_views_for_lba(lba_name: str, summary_df: pd.DataFrame, pt_df: pd.DataFrame, reassess: pd.DataFrame):
-    # Build a robust mask for "contains" across possibly multi-LBA cells (e.g., "Alice, Bob")
     if lba_name and lba_name.lower() != "unassigned":
         mask_sum = summary_df["Supervision LBA"].astype(str).str.lower().str.contains(lba_name.lower(), regex=False)
         mask_pt  = pt_df["Supervision LBA"].astype(str).str.lower().str.contains(lba_name.lower(), regex=False) if pt_df is not None and not pt_df.empty else None
         mask_re  = reassess["Supervision LBA"].astype(str).str.lower().str.contains(lba_name.lower(), regex=False) if reassess is not None and not reassess.empty else None
     else:
-        # Unassigned bucket
         mask_sum = summary_df["Supervision LBA"].fillna("").str.strip().eq("") | summary_df["Supervision LBA"].fillna("Unassigned").eq("Unassigned")
         mask_pt  = (pt_df["Supervision LBA"].fillna("").str.strip().eq("") | pt_df["Supervision LBA"].eq("Unassigned")) if pt_df is not None and not pt_df.empty else None
         mask_re  = (reassess["Supervision LBA"].fillna("").str.strip().eq("") | reassess["Supervision LBA"].eq("Unassigned")) if reassess is not None and not reassess.empty else None
@@ -636,13 +653,11 @@ def filtered_views_for_lba(lba_name: str, summary_df: pd.DataFrame, pt_df: pd.Da
 
 def make_per_lba_zip(all_lbas: list[str], summary_df: pd.DataFrame, pt_df: pd.DataFrame, reassess: pd.DataFrame,
                      sup_percent: float, window_label: str, as_pdf: bool = False) -> bytes:
-    # If no LBAs detected, produce one “All LBAs” report using current filter result.
     targets = all_lbas[:] if all_lbas else ["All LBAs"]
 
     buf = io.BytesIO()
     with ZipFile(buf, "w") as zf:
         for lba in targets:
-            # For "All LBAs", don't filter anything—use the whole current summary/pt/reassess
             if lba == "All LBAs":
                 sum_lba = summary_df
                 pt_lba  = pt_df
@@ -651,7 +666,6 @@ def make_per_lba_zip(all_lbas: list[str], summary_df: pd.DataFrame, pt_df: pd.Da
                 sum_lba, pt_lba, re_lba = filtered_views_for_lba(lba, summary_df, pt_df, reassess)
 
             if (sum_lba is None or sum_lba.empty) and (pt_lba is None or pt_lba.empty) and (re_lba is None or re_lba.empty):
-                # skip empty reports
                 continue
 
             title = f"Authorization Compliance – {lba} ({window_label})"
@@ -660,10 +674,9 @@ def make_per_lba_zip(all_lbas: list[str], summary_df: pd.DataFrame, pt_df: pd.Da
             safe_lba = re.sub(r"[^A-Za-z0-9]+", "_", lba).strip("_").lower() or "all_lbas"
             if as_pdf and PDFKIT_AVAILABLE:
                 try:
-                    pdf_bytes = pdfkit.from_string(html, False)  # returns bytes
+                    pdf_bytes = pdfkit.from_string(html, False)
                     zf.writestr(f"{safe_lba}.pdf", pdf_bytes)
                 except Exception:
-                    # Fallback to HTML if conversion fails
                     zf.writestr(f"{safe_lba}.html", html.encode("utf-8"))
             else:
                 zf.writestr(f"{safe_lba}.html", html.encode("utf-8"))
@@ -683,7 +696,6 @@ html_report = one_page_html_colored(
 )
 
 # ------------------ Split views for tabs ------------------
-# Supervision-focused view
 sup_cols = [
     "Client Name","Auth Start","Auth End","Supervision LBA",
     "BT Service Hours Billed","Supervision Hours Billed",
@@ -713,7 +725,6 @@ with tab_sup:
             st.error(f"❗ {sup5_noncomp} auth window(s) are below the required {sup_percent:.1f}% supervision based on BT hours performed.")
         else:
             st.success(f"✅ Supervision meets or exceeds {sup_percent:.1f}% for all windows.")
-        # Sort to bubble up shortfalls
         sup_view_sorted = sup_view.sort_values(
             ["Supervision 5% OK", "Supervision Shortfall (hrs)"],
             ascending=[True, False]
@@ -745,6 +756,7 @@ with tab_re:
     else:
         st.caption("Status meanings: Overdue 🔴 • Upcoming 🟡 • Not Due Yet 🟢")
         st.dataframe(reassess_df, use_container_width=True)
+
 with tab_trend:
     st.subheader("📈 Client Supervision Compliance Gap")
 
@@ -752,7 +764,6 @@ with tab_trend:
         st.info("No session data available for selected filters.")
         st.stop()
 
-    # ---- Precompute compliance for ALL clients first ----
     aloha["YearMonth"] = aloha["Appt. Date"].dt.to_period("M").dt.to_timestamp()
 
     monthly_all = (
@@ -770,7 +781,6 @@ with tab_trend:
     )
     monthly_all["Compliant"] = monthly_all["Compliance_Gap"] >= 0
 
-    # ---- Toggle to filter clients ----
     show_only_flagged_clients = st.toggle(
         "Show Only Clients With Non-Compliant Months",
         value=False
@@ -799,7 +809,6 @@ with tab_trend:
         st.warning("No data found for this client.")
         st.stop()
 
-    # ---- Compliance Count ----
     failing_count = (~monthly["Compliant"]).sum()
     total_months = len(monthly)
 
@@ -808,10 +817,8 @@ with tab_trend:
     else:
         st.success(f"✅ All {total_months} month(s) are compliant.")
 
-    # ---- Plotly Chart ----
     fig = go.Figure()
 
-    # Compliance Gap Line
     fig.add_trace(go.Scatter(
         x=monthly["YearMonth"],
         y=monthly["Compliance_Gap"],
@@ -830,7 +837,6 @@ with tab_trend:
         )
     ))
 
-    # Red markers for failing months
     failing_months = monthly[~monthly["Compliant"]]
     if not failing_months.empty:
         fig.add_trace(go.Scatter(
@@ -841,7 +847,6 @@ with tab_trend:
             name="Non-Compliant"
         ))
 
-    # Zero reference line
     fig.add_hline(
         y=0,
         line_dash="dash",
@@ -869,13 +874,8 @@ with tab_trend:
         "Compliance_Gap": "Compliance Gap"
     })
 
-    # ✅ Remove internal matching column
     display_table = display_table.drop(columns=["name_key"], errors="ignore")
-
-    # Optional: ensure Month shows date only
     display_table["Month"] = pd.to_datetime(display_table["Month"], errors="coerce").dt.date
-
-
 
     st.dataframe(display_table, use_container_width=True)
 
@@ -909,7 +909,7 @@ with tab_exp:
             "Supervision": sup_view,
             "Parent Training": pt_view,
             "Auth Windows Used": auth_df.sort_values(["Client Name", "Auth Start", "Auth End"]).reset_index(drop=True),
-            "Reassessments": (reassess_df if not reassess_df.empty else pd.DataFrame(columns=["Client Name","Auth Start","Auth End","Reassessment Due","Status","Supervision LBA"]))
+            "Reassessments": (reassess_df if not reassess_df.empty else pd.DataFrame(columns=["Client Name","Auth Start","Reassessment Date","Reassessment Due","Status","Supervision LBA"]))
         })
         st.download_button(
             "⬇️ Download Combined Results (Excel)",
@@ -918,7 +918,7 @@ with tab_exp:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        st.markdown("---")
+    st.markdown("---")
     st.subheader("📊 Compliance Pivot Export (All Clients)")
 
     if not aloha.empty:
@@ -926,7 +926,6 @@ with tab_exp:
         aloha_copy = aloha.copy()
         aloha_copy["YearMonth"] = aloha_copy["Appt. Date"].dt.to_period("M").dt.to_timestamp()
 
-        # Monthly aggregation
         monthly_all = (
             aloha_copy.groupby(["Client Name", "YearMonth"])
             .apply(lambda df: pd.Series({
@@ -941,10 +940,8 @@ with tab_exp:
             monthly_all["Actual_Supervision"] - monthly_all["Required_Supervision"]
         )
 
-        # Convert month to date only
         monthly_all["YearMonth"] = pd.to_datetime(monthly_all["YearMonth"]).dt.date
 
-        # Pivot table
         pivot_df = monthly_all.pivot_table(
             index="Client Name",
             columns="YearMonth",
@@ -952,17 +949,11 @@ with tab_exp:
             aggfunc="sum"
         ).reset_index()
 
-        # Sort month columns chronologically
         month_cols = sorted([c for c in pivot_df.columns if c != "Client Name"])
         pivot_df = pivot_df[["Client Name"] + month_cols]
-
-        # Optional: round values
         pivot_df[month_cols] = pivot_df[month_cols].round(2)
 
-        # Summary metric
         total_clients = len(pivot_df)
-
-        # Count total failing cells
         fail_count = (pivot_df[month_cols] < 0).sum().sum()
 
         if fail_count > 0:
@@ -970,7 +961,6 @@ with tab_exp:
         else:
             st.success(f"✅ All {total_clients} clients compliant for selected window.")
 
-        # Export
         export_bytes = to_excel_bytes({
             "Compliance Pivot": pivot_df
         })
@@ -982,7 +972,7 @@ with tab_exp:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        st.markdown("---")
+    st.markdown("---")
     st.subheader("Per-LBA One-Pager (bulk export)")
 
     if not all_lbas_list:
@@ -1006,4 +996,3 @@ with tab_exp:
             )
         else:
             st.caption("PDF export requires `wkhtmltopdf` + `pdfkit`. Install the wkhtmltopdf binary and `pip install pdfkit`, then restart the app.")
-
