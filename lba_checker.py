@@ -8,6 +8,7 @@ import re
 import io
 from zipfile import ZipFile
 import plotly.graph_objects as go
+from utils import name_key
 
 
 # Optional PDF support via wkhtmltopdf + pdfkit
@@ -18,33 +19,33 @@ try:
 except Exception:
     PDFKIT_AVAILABLE = False
 
-# ⬇️ helper from utils.py (handles "Last, First M" vs "First M Last", ignores middles/suffixes)
-from utils import name_key
-
 st.set_page_config(page_title="Authorization Compliance – Supervision & Parent Training", layout="wide")
 st.title("📊 Authorization Hours & Compliance (Aloha Report)")
 
 st.markdown(
     """
-Upload your **Aloha report** and a single **Authorization + Expectations** file.
+Upload your **Aloha report**, **Authorization report**, and **Zoho case roster**.
 
 **What this checks**
-- **Auth window**: Auth Start = Reassessment Date − 6 months; Auth End = Reassessment Date
+- **Auth window**: uses StartDate and EndDate from the Authorization report
 - **Supervision**: 5% of BT hours actually performed (to-date) per auth window
 - **Parent Training**: at least one PT session **each month** in the auth window
 - Expected supervision (provided per window or computed by weekly × weeks × %)
-- LBA filtering (from Auth/Expected file, not from Aloha)
+- LBA/case filtering from Zoho, including assigned cases with no Aloha sessions
 
-**Matching note:** Names are matched on **(first,last)** only — middles/initials & suffixes are ignored (e.g., *"Rathbone, Sophie"* ↔ *"Rathbone, Sophie R"*).
+**Matching note:** Client, LBA, and rendering-provider names are used in their supplied **Last Name, First Name** format.
 """
 )
 
 # ------------------ Uploads ------------------
 aloha_file = st.file_uploader("Aloha report (CSV or Excel)", type=["csv", "xlsx", "xls"])
-auth_expect_file = st.file_uploader(
-    "Authorization + Expectations file (one file) — required: Child's Full Name, Reassessment Date "
-    "(Auth Start = Reassessment Date − 6 months, Auth End = Reassessment Date); "
-    "optional: Weekly Service Hours, Expected Supervision Hours, Supervision LBA",
+auth_file = st.file_uploader(
+    "Authorization report — required: Client Name, StartDate, EndDate, Service Name, Rendering Provider; "
+    "only Direct Service BT authorizations are used",
+    type=["csv", "xlsx", "xls"]
+)
+zoho_file = st.file_uploader(
+    "Zoho case roster — required: Child's Full Name (or Client Name) and Supervision LBA",
     type=["csv", "xlsx", "xls"]
 )
 
@@ -85,9 +86,11 @@ def colnorm(df: pd.DataFrame) -> pd.DataFrame:
         "Hours": "Billing Hours",
         "Client": "Client Name",
         "Client_name": "Client Name",
-        # Reassessment Date → Auth End (Auth Start is derived as Auth End - 6 months)
-        "Reassessment Date": "Auth End",
-        # Legacy aliases still supported
+        "Child's Full Name": "Client Name",
+        "StartDate": "Auth Start",
+        "Start Date": "Auth Start",
+        "EndDate": "Auth End",
+        "End Date": "Auth End",
         "Auth Start Date": "Auth Start",
         "Authorization Start": "Auth Start",
         "Auth End Date": "Auth End",
@@ -100,6 +103,7 @@ def colnorm(df: pd.DataFrame) -> pd.DataFrame:
         "Supervisor Name": "Supervision LBA",
         "BCBA": "Supervision LBA",
         "BCBA Name": "Supervision LBA",
+        "RenderingProvider": "Rendering Provider",
     }
     for old, new in rename_map.items():
         if old in df.columns and new not in df.columns:
@@ -107,12 +111,33 @@ def colnorm(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def norm_lba_list(v) -> list[str]:
-    if v is None or (isinstance(v, float) and pd.isna(v)): return []
-    parts = [p.strip() for p in str(v).replace(";", ",").split(",")]
+    if v is None or pd.isna(v): return []
+    # A comma belongs to the required "Last Name, First Name" format.
+    parts = [p.strip() for p in str(v).split(";")]
     return [p for p in parts if p]
 
-def lba_key_set(lst: list[str]) -> set[str]:
-    return set(s.lower() for s in lst if s)
+def zoho_lba_name(v) -> str:
+    """Keep the LBA name before Zoho's hyphen-delimited email/phone details."""
+    if v is None or pd.isna(v):
+        return ""
+    name = str(v).split("-", 1)[0].strip()
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+
+def person_name_key(v) -> tuple[str, str]:
+    """Match `First Last` and `Last, First` as the same person."""
+    name = str(v or "").strip().casefold()
+    if not name:
+        return ("", "")
+    if "," in name:
+        last, first = (part.strip() for part in name.split(",", 1))
+        return (first, last)
+    parts = name.split()
+    if len(parts) < 2:
+        return (parts[0], "")
+    return (parts[0], parts[-1])
+
+def lba_key_set(lst: list[str]) -> set[tuple[str, str]]:
+    return {person_name_key(s) for s in lst if s}
 
 def parse_date_series(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.normalize()
@@ -241,47 +266,80 @@ with date_tab3:
 # Apply session date filter
 aloha = aloha[(aloha["Appt. Date"] >= s_start) & (aloha["Appt. Date"] <= s_end)].copy()
 
-# ------------------ Auth periods & per-window hours (SINGLE combined file) ------------------
-# Check if Aloha itself contains auth columns (Auth End required; Auth Start derived if missing)
-auth_in_aloha = "Auth End" in aloha.columns  # colnorm already mapped Reassessment Date → Auth End
+# ------------------ Authorization periods & per-window hours ------------------
+if not auth_file:
+    st.error("Please upload the **Authorization report**.")
+    st.stop()
 
-if auth_in_aloha:
-    maybe_cols = ["Client Name", "Auth Start", "Auth End", "Weekly Service Hours",
-                  "Expected Supervision Hours", "Supervision LBA"]
-    present = [c for c in maybe_cols if c in aloha.columns]
-    auth_df = colnorm(aloha[present].dropna(how="all"))
-else:
-    if not auth_expect_file:
-        st.error("Please upload the **Authorization + Expectations** file (since Aloha does not include auth columns).")
-        st.stop()
-    tmp = colnorm(read_any(auth_expect_file))
-    # After colnorm, Reassessment Date has been mapped to Auth End
-    req = ["Child's Full Name", "Auth End"]
-    miss2 = [c for c in req if c not in tmp.columns]
-    if miss2:
-        st.error(
-            f"Authorization+Expectations file missing columns: {miss2}. "
-            "Expected a 'Reassessment Date' column (or 'Auth End' / 'Auth End Date')."
-        )
-        st.stop()
-    auth_df = tmp.dropna(subset=req).copy()
+tmp = colnorm(read_any(auth_file))
+req = ["Client Name", "Auth Start", "Auth End", "Service Name", "Rendering Provider"]
+miss2 = [c for c in req if c not in tmp.columns]
+if miss2:
+    st.error(f"Authorization report missing required columns: {miss2}.")
+    st.stop()
+
+# A child can have multiple authorizations. Keep only Direct Service BT windows
+# that intersect the reporting dates; sessions are then restricted to each window.
+auth_df = tmp[
+    tmp["Service Name"].astype(str).str.strip().str.casefold().eq("direct service bt")
+].dropna(subset=["Client Name", "Auth Start", "Auth End"]).copy()
 
 # Parse/normalize auth fields
-auth_df["Client Name"] = auth_df["Child's Full Name"].astype(str).str.strip()
+auth_df["Client Name"] = auth_df["Client Name"].astype(str).str.strip()
 auth_df["Auth End"]    = parse_date_series(auth_df["Auth End"])
+auth_df["Auth Start"]  = parse_date_series(auth_df["Auth Start"])
+auth_df = auth_df[
+    (auth_df["Auth Start"] <= s_end) & (auth_df["Auth End"] >= s_start)
+].drop_duplicates(subset=["Client Name", "Auth Start", "Auth End"]).copy()
+if auth_df.empty:
+    st.warning("No Direct Service BT authorization contains the selected reporting dates.")
+    st.stop()
 
-# Derive Auth Start = Auth End - 6 months (override any pre-existing Auth Start column)
-auth_df["Auth Start"] = auth_df["Auth End"].apply(derive_auth_start)
+# Zoho remains the source of truth for which LBA owns each case. Starting from
+# the authorization rows ensures assigned children remain visible at zero hours.
+if not zoho_file:
+    st.error("Please upload the **Zoho case roster** so cases can be assigned to their LBAs.")
+    st.stop()
 
+zoho_df = colnorm(read_any(zoho_file))
+zoho_req = ["Client Name", "Supervision LBA"]
+zoho_missing = [c for c in zoho_req if c not in zoho_df.columns]
+if zoho_missing:
+    st.error(f"Zoho case roster missing required columns: {zoho_missing}.")
+    st.stop()
+
+zoho_df = zoho_df.dropna(subset=zoho_req).copy()
+zoho_df["Client Name"] = zoho_df["Client Name"].astype(str).str.strip()
+zoho_df["Supervision LBA"] = zoho_df["Supervision LBA"].apply(zoho_lba_name)
+zoho_df = zoho_df[zoho_df["Supervision LBA"].ne("")].copy()
+zoho_df["name_key"] = zoho_df["Client Name"].apply(name_key)
 for c in ["Weekly Service Hours", "Expected Supervision Hours"]:
-    if c not in auth_df.columns:
-        auth_df[c] = pd.NA
-auth_df["Weekly Service Hours"]        = pd.to_numeric(auth_df["Weekly Service Hours"], errors="coerce")
-auth_df["Expected Supervision Hours"]  = pd.to_numeric(auth_df["Expected Supervision Hours"], errors="coerce")
-if "Supervision LBA" not in auth_df.columns:
-    auth_df["Supervision LBA"] = pd.NA
-auth_df["LBA List (window)"] = auth_df["Supervision LBA"].apply(norm_lba_list)
+    if c not in zoho_df.columns:
+        zoho_df[c] = pd.NA
+
+def join_unique_names(values) -> str:
+    return "; ".join(dict.fromkeys(str(v).strip() for v in values if pd.notna(v) and str(v).strip()))
+
+zoho_cases = zoho_df.groupby("name_key", as_index=False).agg({
+    "Supervision LBA": join_unique_names,
+    "Weekly Service Hours": "first",
+    "Expected Supervision Hours": "first",
+})
 auth_df["name_key"] = auth_df["Client Name"].apply(name_key)
+missing_auth_cases = zoho_df[~zoho_df["name_key"].isin(auth_df["name_key"])][
+    ["Client Name", "Supervision LBA"]
+].drop_duplicates()
+if not missing_auth_cases.empty:
+    with st.expander(
+        f"⚠️ {len(missing_auth_cases)} Zoho case(s) have no Direct Service BT authorization for the selected dates"
+    ):
+        st.dataframe(missing_auth_cases, use_container_width=True, hide_index=True)
+
+auth_df = auth_df.merge(zoho_cases, on="name_key", how="left", validate="many_to_one")
+auth_df["Weekly Service Hours"] = pd.to_numeric(auth_df["Weekly Service Hours"], errors="coerce")
+auth_df["Expected Supervision Hours"] = pd.to_numeric(auth_df["Expected Supervision Hours"], errors="coerce")
+auth_df["Supervision LBA"] = auth_df["Supervision LBA"].fillna("")
+auth_df["LBA List (window)"] = auth_df["Supervision LBA"].apply(norm_lba_list)
 
 # Per-window expectations map — keyed by (name_key, start, end)
 expect_win_map = {
@@ -308,7 +366,7 @@ expect_map = {
     for _, r in last_per_client.iterrows()
 }
 
-# ------------------ LBA filter (from Auth/Expected only) ------------------
+# ------------------ LBA case-roster filter ------------------
 def lba_keys_from_dfcol(series):
     if series is None or len(series) == 0: return set()
     return set().union(*[lba_key_set(x) for x in series])
@@ -317,16 +375,20 @@ lbas_auth   = lba_keys_from_dfcol(auth_df["LBA List (window)"]) if len(auth_df) 
 lbas_expect = set()
 for v in expect_map.values():
     lbas_expect |= lba_key_set(v.get("lbas", []))
-all_lbas_list = sorted({*(x.title() for x in lbas_auth), *(x.title() for x in lbas_expect)})
+all_lbas_list = sorted({
+    lba
+    for value in zoho_df["Supervision LBA"]
+    for lba in norm_lba_list(value)
+})
 
-st.sidebar.header("LBA filter (from Auth/Expected)")
+st.sidebar.header("LBA case-roster filter")
 selected_lbas = st.sidebar.multiselect(
     "Supervision LBA(s)",
     options=all_lbas_list,
     default=all_lbas_list if all_lbas_list else [],
-    help="Windows are included if their assigned LBA(s) (from Auth or Expected) intersect this list."
+    help="Cases are included according to their Zoho LBA assignment, even when they have no Aloha sessions."
 )
-selected_lbas_keys = set(s.lower() for s in selected_lbas)
+selected_lbas_keys = {person_name_key(s) for s in selected_lbas}
 if not selected_lbas:
     selected_label = "No LBA Selected"
 elif all_lbas_list and len(selected_lbas) == len(all_lbas_list):
